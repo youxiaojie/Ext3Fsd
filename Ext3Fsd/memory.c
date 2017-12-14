@@ -207,7 +207,7 @@ Ext2UnlinkFcb(IN PEXT2_FCB Fcb)
     ExAcquireResourceExclusiveLite(&Vcb->McbLock, TRUE);
     Mcb = Fcb->Mcb;
 
-    DEBUG(DL_ERR, ("Ext2FreeFcb: Fcb (%p) to be unlinked: %wZ.\n",
+    DEBUG(DL_INF, ("Ext2FreeFcb: Fcb (%p) to be unlinked: %wZ.\n",
                     Fcb, Mcb ? &Mcb->FullName : NULL));
 
     if ((Mcb != NULL) && 
@@ -2309,15 +2309,20 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
             __leave;
         }
 
-        /* checking in/compat features */
-        if (IsFlagOn(sb->s_feature_compat, EXT3_FEATURE_COMPAT_HAS_JOURNAL)) {
-            Vcb->IsExt3fs = TRUE;
-        }
-
-        /* don't mount any volumes with external journal devices */
-        if (IsFlagOn(sb->s_feature_incompat, EXT3_FEATURE_INCOMPAT_JOURNAL_DEV)) {
+        /* Reject mounting volume if we encounter unsupported incompat features */
+        if (FlagOn(sb->s_feature_incompat, ~EXT4_FEATURE_INCOMPAT_SUPP)) {
             Status = STATUS_UNRECOGNIZED_VOLUME;
             __leave;
+        }
+
+        /* Mount the volume RO if we encounter unsupported ro_compat features */
+        if (FlagOn(sb->s_feature_ro_compat, ~EXT4_FEATURE_RO_COMPAT_SUPP)) {
+            SetLongFlag(Vcb->Flags, VCB_RO_COMPAT_READ_ONLY);
+        }
+
+        /* Recognize the filesystem as Ext3fs if it supports journalling */
+        if (IsFlagOn(sb->s_feature_compat, EXT4_FEATURE_COMPAT_HAS_JOURNAL)) {
+            Vcb->IsExt3fs = TRUE;
         }
 
         /* check block size */
@@ -2350,6 +2355,7 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
         ExInitializeResourceLite(&Vcb->MetaInode);
         ExInitializeResourceLite(&Vcb->MetaBlock);
         ExInitializeResourceLite(&Vcb->McbLock);
+        ExInitializeResourceLite(&Vcb->FcbLock);
         ExInitializeResourceLite(&Vcb->sbi.s_gd_lock);
 #ifndef _WIN2K_TARGET_
         ExInitializeFastMutex(&Vcb->Mutex);
@@ -2359,7 +2365,6 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
 
         /* initialize Fcb list head */
         InitializeListHead(&Vcb->FcbList);
-        ExInitializeResourceLite(&Vcb->FcbLock);
 
         /* initialize Mcb list head  */
         InitializeListHead(&(Vcb->McbList));
@@ -2387,7 +2392,7 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
 
         /* initialize inode lookaside list */
         ExInitializeNPagedLookasideList(&(Vcb->InodeLookasideList),
-                                        NULL, NULL, 0, sizeof(EXT2_INODE),
+                                        NULL, NULL, 0, Vcb->InodeSize,
                                         'SNIE', 0);
 
         InodeLookasideInitialized = TRUE;
@@ -2747,6 +2752,7 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
             }
 
             if (VcbResourceInitialized) {
+                ExDeleteResourceLite(&Vcb->FcbLock);
                 ExDeleteResourceLite(&Vcb->McbLock);
                 ExDeleteResourceLite(&Vcb->MetaInode);
                 ExDeleteResourceLite(&Vcb->MetaBlock);
@@ -2950,47 +2956,63 @@ Ext2FirstUnusedMcb(PEXT2_VCB Vcb, BOOLEAN Wait, ULONG Number)
     PEXT2_MCB   Mcb = NULL;
     PLIST_ENTRY List = NULL;
     ULONG       i = 0;
+    LARGE_INTEGER   start, now;
 
     if (!ExAcquireResourceExclusiveLite(&Vcb->McbLock, Wait)) {
         return NULL;
     }
 
+    KeQuerySystemTime(&start);
+
     while (Number--) {
 
-        if (!IsListEmpty(&Vcb->McbList)) {
+        BOOLEAN     Skip = TRUE;
 
-            while (i++ < Vcb->NumOfMcb) {
+        if (IsListEmpty(&Vcb->McbList)) {
+            break;
+        }
 
-                List = RemoveHeadList(&Vcb->McbList);
-                Mcb = CONTAINING_RECORD(List, EXT2_MCB, Link);
-                ASSERT(IsFlagOn(Mcb->Flags, MCB_VCB_LINK));
+        while (i++ < Vcb->NumOfMcb) {
 
-                if (Mcb->Fcb == NULL && !IsMcbRoot(Mcb) &&
-                        Mcb->Refercount == 0 &&
-                        (Mcb->Child == NULL || IsMcbSymLink(Mcb))) {
+            KeQuerySystemTime(&now);
+            if (now.QuadPart > start.QuadPart + (LONGLONG)10*1000*1000) {
+                break;
+            }
 
-                    Ext2RemoveMcb(Vcb, Mcb);
-                    ClearLongFlag(Mcb->Flags, MCB_VCB_LINK);
-                    Ext2DerefXcb(&Vcb->NumOfMcb);
+            List = RemoveHeadList(&Vcb->McbList);
+            Mcb = CONTAINING_RECORD(List, EXT2_MCB, Link);
+            ASSERT(IsFlagOn(Mcb->Flags, MCB_VCB_LINK));
 
-                    /* attach all Mcb into a chain*/
-                    if (Head) {
-                        ASSERT(Tail != NULL);
-                        Tail->Next = Mcb;
-                        Tail = Mcb;
-                    } else {
-                        Head = Tail = Mcb;
-                    }
-                    Tail->Next = NULL;
+            if (Mcb->Fcb == NULL && !IsMcbRoot(Mcb) &&
+                    Mcb->Refercount == 0 &&
+                    (Mcb->Child == NULL || IsMcbSymLink(Mcb))) {
 
+                Ext2RemoveMcb(Vcb, Mcb);
+                ClearLongFlag(Mcb->Flags, MCB_VCB_LINK);
+                Ext2DerefXcb(&Vcb->NumOfMcb);
+
+                /* attach all Mcb into a chain*/
+                if (Head) {
+                    ASSERT(Tail != NULL);
+                    Tail->Next = Mcb;
+                    Tail = Mcb;
                 } else {
-
-                    InsertTailList(&Vcb->McbList, &Mcb->Link);
-                    Mcb = NULL;
+                    Head = Tail = Mcb;
                 }
+                Tail->Next = NULL;
+                Skip = FALSE;
+
+            } else {
+
+                InsertTailList(&Vcb->McbList, &Mcb->Link);
+                Mcb = NULL;
             }
         }
+
+        if (Skip)
+            break;
     }
+
     ExReleaseResourceLite(&Vcb->McbLock);
 
     return Head;
@@ -3105,7 +3127,9 @@ Ext2McbReaperThread(
                     LastState = DidNothing = FALSE;
                 }
             }
-
+            if (DidNothing) {
+                KeClearEvent(&Reaper->Wait);
+            }
             if (GlobalAcquired) {
                 ExReleaseResourceLite(&Ext2Global->Resource);
                 GlobalAcquired = FALSE;
@@ -3131,15 +3155,21 @@ BOOLEAN
 Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head)
 {
     struct buffer_head *bh = NULL;
-    PLIST_ENTRY      next = NULL;
-    LARGE_INTEGER   now;
-    BOOLEAN         wake = FALSE;
+    PLIST_ENTRY         next = NULL;
+    LARGE_INTEGER       start, now;
+    BOOLEAN             wake = FALSE;
 
-    KeQuerySystemTime(&now);
+    KeQuerySystemTime(&start);
 
     ExAcquireResourceExclusiveLite(&Vcb->bd.bd_bh_lock, TRUE);
 
     while (!IsListEmpty(&Vcb->bd.bd_bh_free)) {
+
+        KeQuerySystemTime(&now);
+        if (now.QuadPart > start.QuadPart + (LONGLONG)10*1000*1000) {
+            break;
+        }
+
         next = RemoveHeadList(&Vcb->bd.bd_bh_free);
         bh = CONTAINING_RECORD(next, struct buffer_head, b_link);
         if (atomic_read(&bh->b_count)) {
@@ -3152,6 +3182,7 @@ Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head)
             (bh->b_ts_drop.QuadPart + (LONGLONG)10*1000*1000*15) > now.QuadPart ||
             (bh->b_ts_creat.QuadPart + (LONGLONG)10*1000*1000*180) > now.QuadPart) {
             InsertTailList(head, &bh->b_link);
+            buffer_head_remove(&Vcb->bd, bh);
         } else {
             InsertHeadList(&Vcb->bd.bd_bh_free, &bh->b_link);
             break;
@@ -3226,12 +3257,15 @@ Ext2bhReaperThread(
                 Vcb = CONTAINING_RECORD(Link, EXT2_VCB, Next);
                 NonWait = Ext2QueryUnusedBH(Vcb, &List);
             }
+            DidNothing = IsListEmpty(&List);
+            if (DidNothing) {
+                KeClearEvent(&Reaper->Wait);
+            }
             if (GlobalAcquired) {
                 ExReleaseResourceLite(&Ext2Global->Resource);
                 GlobalAcquired = FALSE;
             }
 
-            DidNothing = IsListEmpty(&List);
             while (!IsListEmpty(&List)) {
                 struct buffer_head *bh;
                 Link = RemoveHeadList(&List);
@@ -3260,19 +3294,20 @@ Ext2QueryUnusedFcb(PEXT2_VCB Vcb, PLIST_ENTRY list)
 {
     PEXT2_FCB       Fcb;
     PLIST_ENTRY     next = NULL;
-    LARGE_INTEGER   now;
+    LARGE_INTEGER   start, now;
 
     ULONG           count = 0;
     ULONG           tries = 0;
     BOOLEAN         wake = FALSE;
     BOOLEAN         retry = TRUE;
 
-    KeQuerySystemTime(&now);
+    KeQuerySystemTime(&start);
 
     ExAcquireResourceExclusiveLite(&Vcb->FcbLock, TRUE);
 
 again:
 
+    KeQuerySystemTime(&now);
     while (!IsListEmpty(&Vcb->FcbList)) {
 
         next = RemoveHeadList(&Vcb->FcbList);
@@ -3296,6 +3331,10 @@ again:
         if (++count >= Ext2Global->MaxDepth) {
             break;
         }
+    }
+
+    if (start.QuadPart + 10*1000*1000 > now.QuadPart) {
+        retry = FALSE;
     }
 
     if (retry) {
@@ -3366,12 +3405,15 @@ Ext2FcbReaperThread(
                 Vcb = CONTAINING_RECORD(Link, EXT2_VCB, Next);
                 NonWait = Ext2QueryUnusedFcb(Vcb, &List);
             }
+            DidNothing = IsListEmpty(&List);
+            if (DidNothing) {
+                KeClearEvent(&Reaper->Wait);
+            }
             if (GlobalAcquired) {
                 ExReleaseResourceLite(&Ext2Global->Resource);
                 GlobalAcquired = FALSE;
             }
 
-            DidNothing = IsListEmpty(&List);
             while (!IsListEmpty(&List)) {
                 PEXT2_FCB  Fcb;
                 Link = RemoveHeadList(&List);

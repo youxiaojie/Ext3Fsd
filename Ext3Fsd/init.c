@@ -197,7 +197,7 @@ Ext2QueryGlobalParameters(IN PUNICODE_STRING RegistryPath)
      * 1 writing support
      */
     QueryTable[i].Flags = 0;
-    QueryTable[0].Name = WRITING_SUPPORT;
+    QueryTable[i].Name = WRITING_SUPPORT;
     QueryTable[i].DefaultType = REG_NONE;
     QueryTable[i].DefaultLength = 0;
     QueryTable[i].DefaultData = NULL;
@@ -579,6 +579,11 @@ DriverEntry (
         goto errorout;
     }
 
+#ifdef _PNP_POWER_
+    DiskdevObject->DeviceObjectExtension->PowerControlNeeded = FALSE;
+    CdromdevObject->DeviceObjectExtension->PowerControlNeeded = FALSE;
+#endif
+
     /* initializing */
     Ext2Global->DiskdevObject  = DiskdevObject;
     Ext2Global->CdromdevObject = CdromdevObject;
@@ -601,6 +606,9 @@ DriverEntry (
     DriverObject->MajorFunction[IRP_MJ_FILE_SYSTEM_CONTROL] = Ext2BuildRequest;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL]      = Ext2BuildRequest;
     DriverObject->MajorFunction[IRP_MJ_LOCK_CONTROL]        = Ext2BuildRequest;
+
+    DriverObject->MajorFunction[IRP_MJ_QUERY_EA] = Ext2BuildRequest;
+    DriverObject->MajorFunction[IRP_MJ_SET_EA] = Ext2BuildRequest;
 
     DriverObject->MajorFunction[IRP_MJ_CLEANUP]             = Ext2BuildRequest;
 
